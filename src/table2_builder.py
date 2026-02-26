@@ -276,6 +276,31 @@ def _load_run_dir(artifacts_root: str, policy: str, *, use_selected: bool = True
     return rd
 
 
+def _infer_hidden_layers_from_state(
+    state: Dict[str, Any],
+    *,
+    d_in: int,
+    d_out: int,
+) -> Optional[Tuple[int, int]]:
+    """Infer (h1,h2) for PolicyNetwork from linear layer weight shapes."""
+    try:
+        w0 = state.get("net.0.weight", None)
+        w1 = state.get("net.2.weight", None)
+        w2 = state.get("net.4.weight", None)
+        if not isinstance(w0, torch.Tensor) or not isinstance(w1, torch.Tensor) or not isinstance(w2, torch.Tensor):
+            return None
+        if w0.ndim != 2 or w1.ndim != 2 or w2.ndim != 2:
+            return None
+        h1, in0 = int(w0.shape[0]), int(w0.shape[1])
+        h2, in1 = int(w1.shape[0]), int(w1.shape[1])
+        out2, in2 = int(w2.shape[0]), int(w2.shape[1])
+        if in0 != int(d_in) or out2 != int(d_out) or in1 != h1 or in2 != h2:
+            return None
+        return (h1, h2)
+    except Exception:
+        return None
+
+
 def _load_net_from_run(run_dir: str, params: ModelParams, policy: PolicyName) -> PolicyNetwork:
     """Load a trained policy network from a run directory.
 
@@ -290,25 +315,42 @@ def _load_net_from_run(run_dir: str, params: ModelParams, policy: PolicyName) ->
     if not os.path.exists(w_path):
         raise FileNotFoundError(f"Missing weights in {run_dir} (expected weights.pt or weights_best.pt)")
 
-    # Load training config to reconstruct the exact architecture
+    d_in, d_out = DIMS[str(policy)]
+    state = load_torch(w_path, map_location=params.device)
+    if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
+        state = state["state_dict"]
+    if not isinstance(state, dict):
+        raise RuntimeError(f"Unexpected checkpoint format in {w_path}: expected state_dict-like mapping")
+
+    # Load training config to reconstruct the exact architecture.
+    # Backward compatibility:
+    # - old auto-runs used keys train_config/model_params and could be empty {}
+    # - some checkpoints may miss config fields; then infer hidden dims from weights.
+    hidden: Optional[Tuple[int, int]] = None
+    activation = "selu"
     cfg_path = os.path.join(run_dir, "config.json")
-    cfg = TrainConfig.dev()
     if os.path.exists(cfg_path):
         try:
             packed = load_json(cfg_path)
-            train_cfg = packed.get("train_cfg", {})
-            hidden = tuple(train_cfg.get("hidden_layers", cfg.hidden_layers))
-            activation = str(train_cfg.get("activation", cfg.activation))
-            cfg = TrainConfig.dev(hidden_layers=hidden, activation=activation)
+            train_cfg = packed.get("train_cfg", None)
+            if not isinstance(train_cfg, dict) or len(train_cfg) == 0:
+                train_cfg = packed.get("train_config", {})
+            if isinstance(train_cfg, dict):
+                h = train_cfg.get("hidden_layers", None)
+                if isinstance(h, (list, tuple)) and len(h) == 2:
+                    hidden = (int(h[0]), int(h[1]))
+                a = train_cfg.get("activation", None)
+                if a is not None:
+                    activation = str(a)
         except Exception:
-            # If parsing fails, fall back to dev defaults
-            cfg = TrainConfig.dev()
+            pass
 
-    d_in, d_out = DIMS[str(policy)]
-    net = PolicyNetwork(d_in, d_out, hidden=cfg.hidden_layers, activation=cfg.activation).to(
-        device=params.device, dtype=params.dtype
-    )
-    state = load_torch(w_path, map_location=params.device)
+    if hidden is None:
+        hidden = _infer_hidden_layers_from_state(state, d_in=d_in, d_out=d_out)
+    if hidden is None:
+        hidden = TrainConfig.mid().hidden_layers
+
+    net = PolicyNetwork(d_in, d_out, hidden=hidden, activation=activation).to(device=params.device, dtype=params.dtype)
     net.load_state_dict(state)
     net.eval()
     return net

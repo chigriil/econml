@@ -21,7 +21,14 @@ from .policy_rules import i_taylor, i_modified_taylor, fisher_euler_term
 from .residuals_a1 import residuals_a1
 from .residuals_a2 import residuals_a2
 from .residuals_a3 import residuals_a3
-from .io_utils import save_csv, ensure_dir, make_run_dir, save_run_metadata, _normalize_artifacts_root
+from .io_utils import (
+    save_csv,
+    ensure_dir,
+    make_run_dir,
+    save_run_metadata,
+    _normalize_artifacts_root,
+    pack_config,
+)
 
 
 class PolicyNetwork(nn.Module):
@@ -225,6 +232,9 @@ class Trainer:
                     pass
 
         self.params = self.params.to_torch()
+        # Keep network placement consistent with model params to avoid device/dtype mismatch
+        # in notebooks/scripts that instantiate net on CPU by default.
+        self.net = self.net.to(device=self.params.device, dtype=self.params.dtype)
         set_seeds(self.cfg.seed)
 
         if self.policy == "mod_taylor":
@@ -532,11 +542,7 @@ class Trainer:
             try:
                 save_run_metadata(
                     _rd,
-                    config={
-                        "policy": self.policy,
-                        "train_config": self.cfg.to_dict() if hasattr(self.cfg, "to_dict") else {},
-                        "model_params": self.params.to_dict() if hasattr(self.params, "to_dict") else {},
-                    },
+                    config=pack_config(self.params, self.cfg, extra={"policy": self.policy}),
                 )
             except Exception:
                 pass
